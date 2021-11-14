@@ -58,20 +58,12 @@ public:
     GMPErr err = g_platform_api->createmutex (&m_codec_lock);
     if (GMP_FAILED (err))
         Error (err);
-    err = g_platform_api->createmutex (&m_stop_lock);
-    if (GMP_FAILED (err))
-        Error (err);
-    err = g_platform_api->createmutex (&m_drain_lock);
-    if (GMP_FAILED (err))
-        Error (err);
   }
 
   virtual ~DroidVideoDecoder ()
   {
     // Destroy the Mutex
     m_codec_lock->Destroy ();
-    m_stop_lock->Destroy ();
-    m_drain_lock->Destroy ();
   }
 
 // GMPVideoDecoder methods
@@ -228,6 +220,7 @@ public:
       if (err != GMPNoErr) {
         LOG (ERROR, "Couldn't create new thread");
         Error (GMPGenericErr);
+        cb.unref (cb.data);
         return;
       }
     }
@@ -236,100 +229,86 @@ public:
             &DroidVideoDecoder::SubmitBufferThread, cdata, cb));
   }
 
+  // Called on submit thread
   void SubmitBufferThread (DroidMediaCodecData cdata,
       DroidMediaBufferCallbacks cb)
   {
-    m_drain_lock->Acquire ();
-    if (m_draining || (!m_codec && !CreateCodec ())) {
-      LOG (ERROR, "Buffer submitted while draining");
-      cb.unref (cb.data);
-      m_drain_lock->Release ();
-      return;
-    }
-    m_drain_lock->Release ();
+    m_codec_lock->Acquire ();
 
-    if (m_resetting) {
-      LOG (INFO, "Buffer submitted while resetting");
+    if (m_resetting || m_draining || (!m_codec && !CreateCodec ())) {
+      LOG (ERROR, "Buffer submitted while draining or resetting");
+      cb.unref (cb.data);
+      m_codec_lock->Release ();
       return;
     }
+
+    m_codec_lock->Release ();
 
     // This blocks when the input Source is full
     droid_media_codec_queue (m_codec, &cdata, &cb);
 
-    m_drain_lock->Acquire ();
-    if (!m_draining && m_callback && g_platform_api) {
-      g_platform_api->runonmainthread (WrapTask (m_callback,
-              &GMPVideoDecoderCallback::InputDataExhausted));
+    if (g_platform_api) {
+      g_platform_api->runonmainthread (WrapTask (this,
+              &DroidVideoDecoder::InputDataExhausted_m));
     }
-    m_drain_lock->Release ();
+  }
+
+  void InputDataExhausted_m() {
+    m_codec_lock->Acquire ();
+    if (!m_draining && m_callback) {
+      m_callback->InputDataExhausted();
+    }
+    m_codec_lock->Release ();
   }
 
   virtual void Reset ()
   {
-    m_stop_lock->Acquire ();
-    if (m_resetting) {
-      m_stop_lock->Release ();
-      return;
+    m_codec_lock->Acquire ();
+
+    if (!m_resetting && m_submit_thread) {
+      m_submit_thread->Post (WrapTask (this,
+              &DroidVideoDecoder::ResetCodec));
     }
 
-    m_resetting = true;
-
-    if (m_processing) {
-      // Reset() will be called from DataAvailable() later
-      LOG (INFO, "Reset while m_processing");
-      m_stop_lock->Release ();
-      return;
-    }
-
-    if (g_platform_api) {
-      // Reset() was called. Execute it on main thread
-      g_platform_api->runonmainthread (WrapTask (this,
-              &DroidVideoDecoder::Reset_m));
-    }
-    m_stop_lock->Release ();
+    m_codec_lock->Release ();
   }
 
   virtual void Drain ()
   {
-    if (m_codec) {
-      droid_media_codec_drain (m_codec);
+    m_codec_lock->Acquire ();
+
+    if (!m_draining && m_submit_thread) {
+      m_submit_thread->Post (WrapTask (this,
+              &DroidVideoDecoder::DrainCodec));
     }
 
-    //TODO: This never happens because the codec never really drains, except for EOS
-    m_drain_lock->Acquire ();
-    if (!m_codec || m_dur.size () == 0) {
-      m_callback->DrainComplete ();
-      m_draining = false;
-    } else {
-      m_draining = true;
-    }
-    m_drain_lock->Release ();
+    m_codec_lock->Release ();
   }
 
   virtual void DecodingComplete ()
   {
+    m_codec_lock->Acquire ();
+
     m_callback = nullptr;
     m_host = nullptr;
-    m_resetting = true;
 
-    if (g_platform_api) {
-      // Reset() was called. Execute it on main thread
-      g_platform_api->runonmainthread (WrapTask (this,
-              &DroidVideoDecoder::Reset_m));
+    if (!m_resetting && m_submit_thread) {
+      m_submit_thread->Post (WrapTask (this,
+              &DroidVideoDecoder::ResetCodec));
     }
+
+    m_codec_lock->Release ();
   }
 
   bool CreateCodec ()
   {
-    m_codec_lock->Acquire ();
     m_codec = droid_media_codec_create_decoder (&m_metadata);
-
     if (!m_codec) {
-      m_codec = nullptr;
       LOG (ERROR, "Failed to start the decoder");
       Error (GMPDecodeErr);
       return false;
     }
+
     LOG (INFO, "Codec created for " << m_metadata.parent.type);
 
     {
@@ -346,19 +325,15 @@ public:
       droid_media_codec_set_data_callbacks (m_codec, &cb, this);
     }
     // Reset state
-    m_drain_lock->Acquire ();
     m_draining = false;
-    m_drain_lock->Release ();
 
     if (!droid_media_codec_start (m_codec)) {
       droid_media_codec_destroy (m_codec);
-      m_codec_lock->Release ();
       m_codec = nullptr;
       LOG (ERROR, "Failed to start the decoder");
       Error (GMPDecodeErr);
       return false;
     }
-    m_codec_lock->Release ();
     LOG (DEBUG, "Codec started for " << m_metadata.parent.type);
     return true;
   }
@@ -386,37 +361,10 @@ public:
     m_dropConverter = true;
   }
 
-  void ResetCodec ()
-  {
-    if (m_codec) {
-      LOG (DEBUG, "Codec draining");
-      droid_media_codec_drain (m_codec);
-    }
-
-    LOG (DEBUG, "Stopping submit thread");
-    if (m_submit_thread) {
-      m_submit_thread->Join ();
-      m_submit_thread = nullptr;
-    }
-    LOG (DEBUG, "Stopped submit thread");
-    m_codec_lock->Acquire ();
-    if (m_codec) {
-      LOG (DEBUG, "Codec stopping");
-      droid_media_codec_stop (m_codec);
-      LOG (DEBUG, "Destroying codec");
-      droid_media_codec_destroy (m_codec);
-      LOG (DEBUG, "Codec destroyed");
-      m_codec = nullptr;
-    }
-
-    m_dur.clear ();
-    RequestNewConverter ();
-    m_codec_lock->Release ();
-  }
-
+  // Called on a codec thread.
   void ProcessFrame (DroidMediaCodecData * decoded)
   {
-    m_stop_lock->Acquire ();
+    m_codec_lock->Acquire ();
 
     // Delete the current colour converter if requested
     if (m_dropConverter) {
@@ -428,32 +376,37 @@ public:
 
     if (m_resetting || !m_callback || !m_host) {
         LOG(INFO, "Discarding decoded frame received while resetting");
-        m_stop_lock->Release ();
+        m_codec_lock->Release ();
         return;
     }
 
     m_processing = true;
-    m_stop_lock->Release ();
+    m_codec_lock->Release ();
 
     if (g_platform_api) {
       g_platform_api->syncrunonmainthread (WrapTask (this,
               &DroidVideoDecoder::ProcessFrame_m, decoded));
     }
 
-    m_stop_lock->Acquire ();
+    m_codec_lock->Acquire ();
     m_processing = false;
-    if (m_resetting && g_platform_api) {
-      // Reset() was called. Execute it on main thread
-      g_platform_api->runonmainthread (WrapTask (this,
-              &DroidVideoDecoder::Reset_m));
+    // Reset() was called while processing. Run it on submit thread.
+    if (m_resetting && m_submit_thread) {
+      m_submit_thread->Post (WrapTask (this,
+              &DroidVideoDecoder::ResetCodec));
     }
-    m_stop_lock->Release ();
-
+    m_codec_lock->Release ();
   }
 
   // Return the decoded data back to the parent.
+  // Called on the main thread.
   void ProcessFrame_m (DroidMediaCodecData * data)
   {
+    if (m_resetting || !m_callback || !m_host) {
+        LOG(INFO, "Discarding decoded frame received while resetting");
+        return;
+    }
+
     if (!m_conv) {
       ConfigureOutput (data);
     }
@@ -497,7 +450,6 @@ public:
     // Send the new frame back to Gecko
     m_callback->Decoded (frame);
     LOG (DEBUG, "ProcessFrame: Returning frame ts: " << ts << " dur: " << dur);
-    m_drain_lock->Acquire ();
     if (m_dur.size () == 0 && m_draining) {
       // TODO: we never get the buffers down to 0 with the current SimpleDecodingSource, but EOS will do it
       m_callback->DrainComplete ();
@@ -505,7 +457,6 @@ public:
     } else {
       LOG (DEBUG, "Buffers still out " << m_dur.size ());
     }
-    m_drain_lock->Release ();
   }
 
   virtual void EOS ()
@@ -527,19 +478,90 @@ public:
   }
 
 private:
-
-  virtual void Reset_m ()
+  // Called on submit thread
+  void ResetCodec ()
   {
-    LOG (DEBUG, "Reset_m");
-    if (m_codec) {
-      ResetCodec ();
+    DroidMediaCodec *codec = nullptr;
+
+    m_codec_lock->Acquire ();
+    m_resetting = true;
+
+    // The codec is busy in processing, so ResetCodec will be rescheduled
+    // from ProcessFrame
+    if (m_processing) {
+      m_codec_lock->Release ();
+      return;
     }
-    m_drain_lock->Acquire ();
-    m_draining = false;
-    m_drain_lock->Release ();
-    m_resetting = false;
+
+    if (m_codec) {
+      codec = m_codec;
+      m_codec = nullptr;
+    }
+    m_codec_lock->Release ();
+
+    if (codec) {
+      LOG (DEBUG, "Codec draining");
+      droid_media_codec_drain (codec);
+      LOG (DEBUG, "Codec stopping");
+      droid_media_codec_stop (codec);
+      LOG (DEBUG, "Destroying codec");
+      droid_media_codec_destroy (codec);
+      LOG (DEBUG, "Codec destroyed");
+    }
+
+    if (m_callback && g_platform_api) {
+      g_platform_api->runonmainthread (WrapTask (this,
+              &DroidVideoDecoder::ResetCodecComplete_m));
+    }
+  }
+
+  // Called on the main thread
+  void ResetCodecComplete_m () {
+    LOG (DEBUG, "Stopping submit thread");
+    if (m_submit_thread) {
+      m_submit_thread->Join ();
+      m_submit_thread = nullptr;
+    }
+    LOG (DEBUG, "Stopped submit thread");
+
+    m_codec_lock->Acquire ();
+
+    m_dur.clear ();
+    RequestNewConverter ();
+
     if (m_callback) {
       m_callback->ResetComplete ();
+    }
+
+    m_draining = false;
+    m_resetting = false;
+
+    m_codec_lock->Release ();
+  }
+
+  // Called on submit thread
+  void DrainCodec ()
+  {
+    m_draining = true;
+
+    if (m_codec) {
+      droid_media_codec_drain (m_codec);
+    }
+
+    //TODO: This never happens because the codec never really drains, except for EOS
+    if (!m_codec || m_dur.size () == 0) {
+      if (g_platform_api) {
+        g_platform_api->runonmainthread (WrapTask (this,
+                &DroidVideoDecoder::DrainCodecComplete_m));
+      }
+      m_draining = false;
+    }
+  }
+
+  // Called on the main thread
+  void DrainCodecComplete_m () {
+    if (m_callback) {
+      m_callback->DrainComplete ();
     }
   }
 
@@ -581,13 +603,7 @@ private:
 
   GMPVideoHost *m_host;
   GMPVideoDecoderCallback *m_callback = nullptr;
-  // Codec lock makes sure that the codec isn't recreated while it's being destroyed
   GMPMutex *m_codec_lock = nullptr;
-  // Stop lock prevents a deadlock when droid_media_codec_loop can't quit during
-  // shutdown because it's waiting to get a frame processed on the main thread.
-  GMPMutex *m_stop_lock = nullptr;
-  // Drain lock protects the m_draining flag
-  GMPMutex *m_drain_lock = nullptr;
   GMPThread *m_submit_thread = nullptr;
   DroidMediaCodecDecoderMetaData m_metadata;
   DroidMediaCodec *m_codec = nullptr;
@@ -672,10 +688,32 @@ public:
     m_metadata.slice_height = codecSettings.mHeight;
     m_metadata.meta_data = false;
 
+    droid_media_colour_format_constants_init (&m_constants);
+    m_metadata.color_format = -1;
+
     {
-      DroidMediaColourFormatConstants c;
-      droid_media_colour_format_constants_init(&c);
-      m_metadata.color_format = c.OMX_COLOR_FormatYUV420Planar;
+      uint32_t supportedFormats[32];
+      unsigned int nFormats = droid_media_codec_get_supported_color_formats (
+          &m_metadata.parent, 1, supportedFormats, 32);
+
+      LOG (INFO, "Found " << nFormats << " color formats supported:");
+      for (unsigned int i = 0; i < nFormats; i++) {
+        int fmt = static_cast<int>(supportedFormats[i]);
+        LOG (INFO, "  " << std::hex << fmt << std::dec);
+        // The list of formats is sorted in order of codec's preference,
+        // so pick the first one supported.
+        if (m_metadata.color_format == -1 &&
+            (fmt == m_constants.OMX_COLOR_FormatYUV420Planar ||
+             fmt == m_constants.OMX_COLOR_FormatYUV420SemiPlanar)) {
+          m_metadata.color_format = fmt;
+        }
+      }
+    }
+
+    if (m_metadata.color_format == -1) {
+      LOG (ERROR, "No supported color format found");
+      Error (GMPNotImplementedErr);
+      return;
     }
 
     LOG (INFO,
@@ -683,7 +721,8 @@ public:
         << " width=" << m_metadata.parent.width
         << " height=" << m_metadata.parent.height
         << " fps=" << m_metadata.parent.fps
-        << " bitrate=" << m_metadata.bitrate);
+        << " bitrate=" << m_metadata.bitrate
+        << " color_format=" << m_metadata.color_format);
   }
 
   void Encode (GMPVideoi420Frame* inputFrame,
@@ -725,9 +764,18 @@ public:
 
     memcpy(buf, inputFrame->Buffer(kGMPYPlane), y_size);
     buf += y_size;
-    memcpy(buf, inputFrame->Buffer(kGMPUPlane), u_size);
-    buf += u_size;
-    memcpy(buf, inputFrame->Buffer(kGMPVPlane), v_size);
+    if (m_metadata.color_format == m_constants.OMX_COLOR_FormatYUV420Planar) {
+      memcpy(buf, inputFrame->Buffer(kGMPUPlane), u_size);
+      buf += u_size;
+      memcpy(buf, inputFrame->Buffer(kGMPVPlane), v_size);
+    } else {
+      uint8_t *inpU = inputFrame->Buffer(kGMPUPlane);
+      uint8_t *inpV = inputFrame->Buffer(kGMPVPlane);
+      for (unsigned i = 0; i < u_size + v_size; i += 2) {
+        buf[i] = *inpU++;
+        buf[i + 1] = *inpV++;
+      }
+    }
 
     data.ts = inputFrame->Timestamp();
     data.sync = frameTypes[0] == kGMPKeyFrame;
@@ -768,9 +816,11 @@ public:
     m_stop_lock->Release();
 
     LOG (INFO, "EncodingComplete");
-    droid_media_codec_stop(m_codec);
-    droid_media_codec_destroy(m_codec);
-    LOG (INFO, "EncodingComplete: Codec destroyed");
+    if (m_codec) {
+      droid_media_codec_stop(m_codec);
+      droid_media_codec_destroy(m_codec);
+      LOG (INFO, "EncodingComplete: Codec destroyed");
+    }
     m_stopping = false;
     m_codec = nullptr;
   }
@@ -792,6 +842,7 @@ private:
   GMPMutex *m_stop_lock = nullptr;
   bool m_processing = false;
   bool m_stopping = false;
+  DroidMediaColourFormatConstants m_constants;
 
   bool CreateEncoder ()
   {
@@ -1007,8 +1058,10 @@ GMPErr GMPInit (GMPPlatformAPI * platformAPI)
 {
   LOG (DEBUG, "Initializing droidmedia!");
   g_platform_api = platformAPI;
-  droid_media_init ();
-  return GMPNoErr;
+  if (droid_media_init ())
+    return GMPNoErr;
+  else
+    return GMPNotImplementedErr;
 }
 
 GMPErr GMPGetAPI (const char *apiName, void *hostAPI, void **pluginApi)
